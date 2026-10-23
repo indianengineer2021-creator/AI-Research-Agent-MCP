@@ -32,9 +32,9 @@ from mcp_client import find_fetch_tools, find_search_tools
 logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\"')]+", re.IGNORECASE)
 REFERENCE_PATTERN = re.compile(r"ref://[A-Za-z0-9_-]+", re.IGNORECASE)
-MAX_RESULT_CHARS = 6000
-MAX_SEARCH_RESULTS = 4
-MAX_ANALYSIS_CONTEXT_CHARS = 7500
+MAX_RESULT_CHARS = 2400
+MAX_SEARCH_RESULTS = 3
+MAX_ANALYSIS_CONTEXT_CHARS = 4000
 MAX_REGISTERED_SOURCES = 15
 
 
@@ -151,6 +151,33 @@ def _bounded_search_args(tool: BaseTool, arguments: dict[str, Any]) -> dict[str,
     return bounded
 
 
+def _query_for_tool_call(
+    tool_call: dict[str, Any], pending_queries: list[str], completed_queries: set[str]
+) -> str | None:
+    """Associate a model-issued search call with one requested query."""
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return None
+    requested_query = next(
+        (
+            str(arguments[field]).strip()
+            for field in ("query", "search_query", "q", "text", "keywords")
+            if arguments.get(field)
+        ),
+        "",
+    )
+    if requested_query:
+        normalized_request = requested_query.casefold()
+        for query in pending_queries:
+            if query.casefold() == normalized_request and query not in completed_queries:
+                return query
+        return None
+    return next(
+        (query for query in pending_queries if query not in completed_queries),
+        None,
+    )
+
+
 def _url_args(tool: BaseTool, url: str) -> dict[str, Any]:
     """Map a source URL to a common page-reader argument."""
     fields = getattr(tool, "args", {})
@@ -197,19 +224,20 @@ def _format_results_for_prompt(
             for url in result["urls"]
             if url in registry
         ]
-        block = json.dumps(
-            {
-                "query": result["query"],
-                "tool": result["tool"],
-                "sources": citation_numbers,
-                "content": result["content"],
-                "error": result["error"],
-            },
-            ensure_ascii=False,
-        )
+        content = result["content"][:MAX_RESULT_CHARS]
+        record = {
+            "query": result["query"],
+            "tool": result["tool"],
+            "sources": citation_numbers,
+            "content": content,
+            "error": result["error"],
+        }
+        block = json.dumps(record, ensure_ascii=False)
+        while len(block) > remaining_chars and content:
+            content = content[: max(0, len(content) - (len(block) - remaining_chars))]
+            record["content"] = content
+            block = json.dumps(record, ensure_ascii=False)
         if len(block) > remaining_chars:
-            block = block[:remaining_chars]
-        if not block:
             break
         blocks.append(block)
         remaining_chars -= len(block) + 2
@@ -258,7 +286,7 @@ async def searcher(
     search_tool_names: list[str],
     fetch_tool_names: list[str],
 ) -> dict[str, Any]:
-    """Search each pending query via MCP and optionally fetch useful pages."""
+    """Select MCP search calls in one model request, then execute each via MCP."""
     search_tools = find_search_tools(tools, search_tool_names)
     if not search_tools:
         raise RuntimeError(
@@ -272,92 +300,111 @@ async def searcher(
     previous_queries = {result["query"] for result in existing_results}
     pending_queries = [query for query in current_queries if query not in previous_queries]
     new_results: list[SearchResult] = []
-
-    for query in pending_queries:
-        called_search_tool = False
+    completed_queries: set[str] = set()
+    decision: Any = None
+    if pending_queries:
         try:
             decision = await invoke_with_retry(
                 bound_llm.ainvoke,
                 [
                     SystemMessage(content=SEARCH_TOOL_SYSTEM_PROMPT),
                     HumanMessage(
-                        content=SEARCH_TOOL_USER_PROMPT.format(query=query)
+                        content=SEARCH_TOOL_USER_PROMPT.format(
+                            queries="\n".join(
+                                f"{index}. {query}"
+                                for index, query in enumerate(
+                                    pending_queries, start=1
+                                )
+                            )
+                        )
                     ),
                 ],
                 operation="search tool selection",
             )
         except Exception as exc:
-            logger.warning("LLM tool selection failed for query %r: %s", query, exc)
-            decision = None
+            logger.warning("LLM search-tool selection failed: %s", exc)
 
-        for tool_call in getattr(decision, "tool_calls", []) if decision else []:
-            called_tool_name = _tool_name(tool_call)
-            tool = tool_by_name.get(called_tool_name)
-            if tool is None:
-                logger.warning("Model selected unknown MCP tool %r", called_tool_name)
-                continue
-            if not any(candidate.name == tool.name for candidate in search_tools):
-                logger.warning(
-                    "Ignoring non-search MCP tool call %r from the model",
-                    called_tool_name,
-                )
-                continue
-            try:
-                arguments = tool_call.get("args", {})
-                if any(candidate.name == tool.name for candidate in search_tools):
-                    arguments = _bounded_search_args(tool, arguments)
-                output = await tool.ainvoke(arguments)
-                new_results.append(_result_record(query, tool.name, output))
-                called_search_tool = True
-            except Exception as exc:
-                logger.exception("MCP tool %s failed for query %r", tool.name, query)
-                new_results.append(
-                    _result_record(query, tool.name, "", error=str(exc))
-                )
+    for tool_call in getattr(decision, "tool_calls", []) if decision else []:
+        called_tool_name = _tool_name(tool_call)
+        tool = tool_by_name.get(called_tool_name)
+        if tool is None:
+            logger.warning("Model selected unknown MCP tool %r", called_tool_name)
+            continue
+        if not any(candidate.name == tool.name for candidate in search_tools):
+            logger.warning(
+                "Ignoring non-search MCP tool call %r from the model",
+                called_tool_name,
+            )
+            continue
+        query = _query_for_tool_call(tool_call, pending_queries, completed_queries)
+        if query is None:
+            logger.warning("Ignoring extra MCP search call without a pending query")
+            continue
+        try:
+            arguments = tool_call.get("args", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+            output = await tool.ainvoke(_bounded_search_args(tool, arguments))
+            new_results.append(_result_record(query, tool.name, output))
+            completed_queries.add(query)
+        except Exception as exc:
+            logger.exception("MCP tool %s failed for query %r", tool.name, query)
+            new_results.append(_result_record(query, tool.name, "", error=str(exc)))
+            completed_queries.add(query)
 
-        if not called_search_tool:
-            search_tool = search_tools[0]
-            try:
-                output = await search_tool.ainvoke(_query_args(search_tool, query))
-                new_results.append(_result_record(query, search_tool.name, output))
-                called_search_tool = True
-            except Exception as exc:
-                logger.exception(
-                    "MCP search tool %s failed for query %r",
-                    search_tool.name,
-                    query,
-                )
-                new_results.append(
-                    _result_record(query, search_tool.name, "", error=str(exc))
-                )
+    for query in pending_queries:
+        if query in completed_queries:
+            continue
+        search_tool = search_tools[0]
+        try:
+            output = await search_tool.ainvoke(_query_args(search_tool, query))
+            new_results.append(_result_record(query, search_tool.name, output))
+            completed_queries.add(query)
+        except Exception as exc:
+            logger.exception(
+                "MCP search tool %s failed for query %r",
+                search_tool.name,
+                query,
+            )
+            new_results.append(
+                _result_record(query, search_tool.name, "", error=str(exc))
+            )
+            completed_queries.add(query)
 
-        if fetch_tools and called_search_tool:
-            query_targets = list(
-                dict.fromkeys(
-                    target
-                    for result in new_results
-                    if result["query"] == query
-                    for target in (
-                        result["urls"]
-                        + REFERENCE_PATTERN.findall(result["content"])
-                    )
+    if fetch_tools:
+        page_targets = list(
+            dict.fromkeys(
+                target
+                for result in new_results
+                for target in (
+                    result["urls"] + REFERENCE_PATTERN.findall(result["content"])
                 )
             )
-            for target in query_targets[:1]:
-                fetch_tool = fetch_tools[0]
-                try:
-                    output = await fetch_tool.ainvoke(_url_args(fetch_tool, target))
-                    new_results.append(_result_record(query, fetch_tool.name, output))
-                except Exception as exc:
-                    logger.warning(
-                        "Optional page fetch via %s failed for %s: %s",
-                        fetch_tool.name,
-                        target,
-                        exc,
-                    )
-                    new_results.append(
-                        _result_record(query, fetch_tool.name, "", error=str(exc))
-                    )
+        )
+        if page_targets:
+            target = page_targets[0]
+            fetch_tool = fetch_tools[0]
+            query = next(
+                (
+                    result["query"]
+                    for result in new_results
+                    if target in result["urls"] or target in result["content"]
+                ),
+                pending_queries[0],
+            )
+            try:
+                output = await fetch_tool.ainvoke(_url_args(fetch_tool, target))
+                new_results.append(_result_record(query, fetch_tool.name, output))
+            except Exception as exc:
+                logger.warning(
+                    "Optional page fetch via %s failed for %s: %s",
+                    fetch_tool.name,
+                    target,
+                    exc,
+                )
+                new_results.append(
+                    _result_record(query, fetch_tool.name, "", error=str(exc))
+                )
 
     logger.info(
         "Search iteration %d completed with %d new result(s)",

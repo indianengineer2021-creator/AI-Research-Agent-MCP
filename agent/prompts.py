@@ -9,10 +9,9 @@ research question yourself.
 """
 
 SEARCH_TOOL_SYSTEM_PROMPT = """\
-You are the retrieval controller for a research agent. For the supplied web
-search query, call an available web-search MCP tool. Do not call page-reader
-tools; the application fetches only URLs returned by the search tool. Do not
-answer the research question or invent sources.
+You are the retrieval controller. Call an available web-search MCP tool exactly
+once for each query in the supplied list, using the query text as given. Do not
+call page-reader tools or answer the research question.
 """
 
 ANALYZER_SYSTEM_PROMPT = """\
@@ -54,8 +53,9 @@ Recent conversation context:
 """
 
 SEARCH_TOOL_USER_PROMPT = """\
-Use a web-search MCP tool for this query and return tool calls only:
-{query}
+Search each query exactly once using the MCP search tool. Do not fetch pages.
+
+{queries}
 """
 
 ANALYZER_USER_PROMPT = """\

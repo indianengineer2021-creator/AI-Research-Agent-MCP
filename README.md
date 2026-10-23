@@ -181,9 +181,10 @@ coverage, and factual grounding as the agent changes.
   names exposed by the MCP server. The app also tries to infer tools from their
   name and description.
 - **Groq rate limit or transient API error:** the agent retries temporary
-  failures up to three times. Search results are capped and analyzed
-  incrementally to keep requests within smaller token-per-minute limits. If
-  the error persists, wait for quota to recover or use a lower-volume model.
+  failures up to three times. Search tools are selected in one model request
+  per pass, results are capped, and evidence is analyzed incrementally to keep
+  token use down. If Groq still reports a token-per-minute limit, wait about a
+  minute, choose a smaller model, or lower the search iteration limit.
 - **Groq model not found:** model availability depends on the Groq account and
   changes over time. The default is `openai/gpt-oss-120b`, which was verified
   against the configured account; choose another currently available model in

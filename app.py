@@ -12,7 +12,7 @@ import streamlit as st
 from langchain_core.messages import HumanMessage
 
 from agent.graph import build_research_graph
-from agent.llm import MissingAPIKeyError, create_llm
+from agent.llm import LLMTokenLimitError, MissingAPIKeyError, create_llm
 from config import (
     DEFAULT_MAX_SEARCH_ITERATIONS,
     DEFAULT_MODEL,
@@ -284,6 +284,9 @@ if question:
         except MissingAPIKeyError as exc:
             logger.warning("Research request missing Groq API key")
             st.error(str(exc), icon=":material/key_off:")
+        except LLMTokenLimitError as exc:
+            logger.warning("Research request exceeded the Groq token quota")
+            st.error(str(exc), icon=":material/hourglass_empty:")
         except MCPConnectionError as exc:
             logger.exception("MCP connection failed")
             st.error(str(exc), icon=":material/wifi_off:")

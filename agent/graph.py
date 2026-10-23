@@ -42,7 +42,8 @@ def build_research_graph(
 
     config = mcp_config or load_mcp_config()
     search_tool_names = config.get("search_tool_names", [])
-    if not find_search_tools(tools, search_tool_names):
+    search_tools = find_search_tools(tools, search_tool_names)
+    if not search_tools:
         available = ", ".join(tool.name for tool in tools)
         raise ValueError(
             "No MCP search tool was found. Configure search_tool_names in "
@@ -50,7 +51,7 @@ def build_research_graph(
         )
 
     try:
-        bound_llm = llm.bind_tools(tools)
+        bound_llm = llm.bind_tools(search_tools)
     except Exception as exc:
         logger.exception("Could not bind MCP tools to the Groq model")
         raise RuntimeError(

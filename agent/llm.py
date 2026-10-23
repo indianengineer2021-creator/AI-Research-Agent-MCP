@@ -10,6 +10,8 @@ from typing import TypeVar
 
 from langchain_groq import ChatGroq
 
+from config import DEFAULT_MODEL
+
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
@@ -26,9 +28,13 @@ class MissingAPIKeyError(ValueError):
     """Raised if a Groq API key was not configured."""
 
 
+class LLMTokenLimitError(RuntimeError):
+    """Raised when Groq rejects a request for exceeding its token quota."""
+
+
 def create_llm(
     api_key: str | None = None,
-    model: str = "llama-3.3-70b-versatile",
+    model: str = DEFAULT_MODEL,
     temperature: float = 0.2,
 ) -> ChatGroq:
     """Create a Groq chat model, preferring an explicit UI key over the env key."""
@@ -69,6 +75,15 @@ async def invoke_with_retry(
         try:
             return await invoke(value)
         except Exception as exc:
+            if getattr(exc, "status_code", None) == 413 or (
+                "tokens per minute" in str(exc).casefold()
+            ):
+                logger.warning("Groq token limit reached during '%s'", operation)
+                raise LLMTokenLimitError(
+                    "Groq rejected this request because the account's token limit "
+                    "was reached. Wait about a minute and retry, or choose a smaller "
+                    "model and reduce the maximum search iterations."
+                ) from exc
             if not is_transient_llm_error(exc) or attempt == attempts:
                 logger.exception(
                     "LLM operation '%s' failed on attempt %d/%d",
